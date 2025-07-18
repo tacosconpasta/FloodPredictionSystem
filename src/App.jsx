@@ -3,6 +3,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import { useState, useEffect } from "react";
 import MapTools from "./components/MapTools.jsx";
 import RiverPathControls from "./components/controls/RiverPathControl.jsx";
+import FloodRiskManager from "./components/FloodRiskManager.jsx"; // Add this import
 import { createMapStyle } from "./lib/utils/createMapStyle.js";
 import {
   saveRiverPath,
@@ -18,6 +19,7 @@ function App() {
   const [riverPath, setRiverPath] = useState([]);
   const [savedPaths, setSavedPaths] = useState([]);
   const [controlsOpen, setControlsOpen] = useState(true);
+  const [floodRiskZones, setFloodRiskZones] = useState(null); // Add this state
 
   // Load saved paths on component mount
   useEffect(() => {
@@ -77,11 +79,17 @@ function App() {
     }
   };
 
-  // Generate map style with river path
+  // Handle flood risk updates from FloodRiskManager
+  const handleFloodRiskUpdate = (riskZones) => {
+    setFloodRiskZones(riskZones);
+  };
+
+  // Generate map style with river path and flood risk zones
   const mapStyle = createMapStyle({
     predictionTime,
     rainOpacity,
     riverPath,
+    floodRiskZones, // Pass flood risk zones to map style
   });
 
   const [pitchAngle, setPitchAngle] = useState(40);
@@ -129,6 +137,12 @@ function App() {
               onSave={saveCurrentPath}
               onLoad={loadSavedPath}
               onDelete={deleteSavedPath}
+            />
+            <FloodRiskManager
+              riverPath={riverPath}
+              predictionTime={predictionTime}
+              onFloodRiskUpdate={handleFloodRiskUpdate}
+              flowVelocity={18} // 18 m/s as you specified
             />
           </div>
         )}

@@ -16,7 +16,7 @@ function MapTools({
   const toggleTools = () => setOpen((prev) => !prev);
 
   return (
-    <div className="flex flex-col gap-10">
+    <div className="flex flex-col gap-10 w-full">
       <button
         onClick={toggleTools}
         className="bg-slate-800 text-white px-6 py-3 rounded-lg hover:bg-slate-700"
@@ -26,9 +26,16 @@ function MapTools({
 
       {open && (
         <div
-          className="p-4 bg-white/80 backdrop-blur-md rounded-xl flex flex-col gap-10 max-h-100 overflow-y-auto"
+          className="p-4 bg-white/80 backdrop-blur-md rounded-xl flex flex-col gap-10 max-h-100 overflow-y-auto mt-20"
           style={{ boxSizing: "border-box" }}
         >
+          <button
+            onClick={toggleTools}
+            className="bg-slate-800 text-white px-6 py-3 rounded-lg hover:bg-slate-700"
+          >
+            {open ? "Close Tools" : "Map Tools"}
+          </button>
+
           <div className="flex flex-col gap-5">
             <p className="">Change pitch angle</p>
             <PitchSetter
