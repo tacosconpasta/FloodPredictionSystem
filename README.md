@@ -35,6 +35,12 @@ La falta de sistemas de alerta temprana en muchas de estas áreas limita la capa
 
 Cada píxel de las parcelas meteorológicas se convierte a una tasa de lluvia (mm/h) usando la leyenda oficial de OpenPortGuide, verificada muestreando las teselas reales:
 
+<div align="center">
+
+![Parcelas Ejemplo](.github/assets/parcelas.png)
+
+_Imagen de las Parcelas de precipitación_
+
 |                          Color                           | RGB         | Tasa (mm/h) |                          Color                           | RGB           | Tasa (mm/h) |
 | :------------------------------------------------------: | :---------- | :---------- | :------------------------------------------------------: | :------------ | :---------- |
 | ![#00FFFF](https://placehold.co/14x14/00FFFF/00FFFF.png) | `0,255,255` | ≥ 0.1       | ![#00008B](https://placehold.co/14x14/00008B/00008B.png) | `0,0,139`     | ≥ 4         |
@@ -43,6 +49,10 @@ Cada píxel de las parcelas meteorológicas se convierte a una tasa de lluvia (m
 | ![#0066FF](https://placehold.co/14x14/0066FF/0066FF.png) | `0,102,255` | ≥ 0.7       | ![#DB00DB](https://placehold.co/14x14/DB00DB/DB00DB.png) | `219,0,219`   | ≥ 20        |
 | ![#0033FF](https://placehold.co/14x14/0033FF/0033FF.png) | `0,51,255`  | ≥ 1         | ![#FC58FC](https://placehold.co/14x14/FC58FC/FC58FC.png) | `252,88,252`  | ≥ 40        |
 | ![#0000D7](https://placehold.co/14x14/0000D7/0000D7.png) | `0,0,215`   | ≥ 2         | ![#FC97FC](https://placehold.co/14x14/FC97FC/FC97FC.png) | `252,151,252` | ≥ 70        |
+
+_Tabla de representación valores de precipitación en mm/h_
+
+</div>
 
 ### 2. Lluvia acumulada entre parcelas
 
