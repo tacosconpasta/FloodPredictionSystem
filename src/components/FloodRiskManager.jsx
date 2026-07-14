@@ -7,170 +7,86 @@ const FloodRiskManager = ({
   riverPath,
   predictionTime,
   onFloodRiskUpdate,
-  flowVelocity = 18, // m/s
+  riverSpeed,
+  setRiverSpeed,
+  riverWidth,
+  setRiverWidth,
 }) => {
   const [isActive, setIsActive] = useState(false);
-  const [riskZones, setRiskZones] = useState(null);
-  const [precipitationData, setPrecipitationData] = useState(null);
-  const [analysisStats, setAnalysisStats] = useState(null);
-  const [debugInfo, setDebugInfo] = useState("");
-  const floodCalculatorRef = useRef(null);
-  const precipitationAnalyzerRef = useRef(null);
-  const intervalRef = useRef(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [rainfall, setRainfall] = useState(null);
+  const [analysis, setAnalysis] = useState(null);
+  const [statusMessage, setStatusMessage] = useState("");
+  const analyzerRef = useRef(null); // persists so the tile cache survives re-analysis
+  if (!analyzerRef.current) analyzerRef.current = new PrecipitationAnalyzer();
 
-  // Initialize flood risk calculator and precipitation analyzer when river path changes
-  useEffect(() => {
-    if (riverPath && riverPath.length > 1) {
-      floodCalculatorRef.current = new FloodRiskCalculator(
-        riverPath,
-        flowVelocity
-      );
-      precipitationAnalyzerRef.current = new PrecipitationAnalyzer();
-    }
-  }, [riverPath, flowVelocity]);
-
-  // Analyze real precipitation data along river path using current predictionTime
-  const analyzePrecipitationAlongPath = useCallback(async () => {
-    if (
-      !precipitationAnalyzerRef.current ||
-      !riverPath ||
-      riverPath.length < 2
-    ) {
-      setDebugInfo("No analyzer or river path too short");
-      return null;
-    }
-
-    try {
-      setDebugInfo("Starting precipitation analysis...");
-      const currentTimeOffset = parseInt(predictionTime) || 0;
-      const referenceTimeOffset = currentTimeOffset === 0 ? 6 : 0;
-
-      setDebugInfo(
-        `Analyzing ${currentTimeOffset}h vs ${referenceTimeOffset}h...`
-      );
-
-      const comparison =
-        await precipitationAnalyzerRef.current.comparePrecipitationData(
-          riverPath,
-          currentTimeOffset,
-          referenceTimeOffset,
-          10 // zoom level
-        );
-
-      setDebugInfo(
-        `Analysis complete. Found ${comparison.currentData.length} data points`
-      );
-      console.log("Precipitation comparison result:", comparison);
-
-      setPrecipitationData(comparison);
-      setAnalysisStats(comparison.summary);
-
-      return comparison;
-    } catch (error) {
-      console.error("Error analyzing precipitation data:", error);
-      setDebugInfo(`Error: ${error.message}`);
-      return null;
-    }
-  }, [riverPath, predictionTime]);
-
-  // Update flood risk with real precipitation data using predictionTime
-  const updateFloodRiskWithRealData = useCallback(async () => {
-    if (
-      !floodCalculatorRef.current ||
-      !precipitationAnalyzerRef.current ||
-      !isActive
-    ) {
+  const runAnalysis = useCallback(async () => {
+    if (!riverPath || riverPath.length < 2) {
+      setStatusMessage("River path too short to analyze");
       return;
     }
 
+    setIsAnalyzing(true);
     try {
-      const comparison = await analyzePrecipitationAlongPath();
+      setStatusMessage("Sampling precipitation tiles...");
+      const rain = await analyzerRef.current.analyzeRainfallAlongPath(
+        riverPath,
+        Number(predictionTime) || 0
+      );
+      setRainfall(rain);
 
-      if (comparison && comparison.changes.length > 0) {
-        const currentTimeOffset = parseInt(predictionTime) || 0;
-        const timestamp = Date.now() - currentTimeOffset * 3600000;
+      const calculator = new FloodRiskCalculator(riverPath, {
+        riverSpeed: Number(riverSpeed),
+        riverWidth: Number(riverWidth),
+      });
+      const result = calculator.analyze(rain.points, rain.intervalHours);
+      setAnalysis(result);
 
-        // Add precipitation changes to flood risk calculator
-        comparison.changes.forEach((change) => {
-          floodCalculatorRef.current.addPrecipitationData(
-            timestamp,
-            change.currentIntensity,
-            [change.segmentIndex]
-          );
-        });
-      }
-
-      // Generate updated flood risk zones with current precipitation data
-      const currentTime = Date.now();
-      const currentPrecipitationData = comparison
-        ? comparison.currentData
-        : null;
-
-      // Use the enhanced method that considers both moving water and current precipitation
-      const riskZones =
-        floodCalculatorRef.current.generateCombinedFloodRiskZones(
-          currentTime,
-          currentPrecipitationData
-        );
-
-      setRiskZones(riskZones);
-
-      // Clean up old water parcels
-      floodCalculatorRef.current.cleanupOldParcels(currentTime);
-
-      // Notify parent component of updated risk zones
-      if (onFloodRiskUpdate) {
-        onFloodRiskUpdate(riskZones);
-      }
-
-      return { riskZones, precipitationData: comparison };
+      onFloodRiskUpdate?.(calculator.generateFloodRiskZones(result));
+      setStatusMessage(
+        `Analyzed ${rain.points.length} points using the +${
+          rain.timeOffsets.current
+        }h and ${
+          rain.timeOffsets.next !== null
+            ? `+${rain.timeOffsets.next}h`
+            : "(last)"
+        } parcels (${rain.intervalHours}h interval)`
+      );
     } catch (error) {
-      console.error("Error updating flood risk with real data:", error);
-      return null;
+      console.error("Error analyzing flood risk:", error);
+      setStatusMessage(`Error: ${error.message}`);
+    } finally {
+      setIsAnalyzing(false);
     }
-  }, [
-    isActive,
-    predictionTime,
-    analyzePrecipitationAlongPath,
-    onFloodRiskUpdate,
-  ]);
+  }, [riverPath, predictionTime, riverSpeed, riverWidth, onFloodRiskUpdate]);
 
-  // Start flood risk monitoring with real precipitation analysis
-  const startMonitoring = async () => {
-    setIsActive(true);
+  // Keep a ref to the latest analysis function so the effects below don't
+  // re-fire just because a parent render recreated a callback prop.
+  const runAnalysisRef = useRef(runAnalysis);
+  useEffect(() => {
+    runAnalysisRef.current = runAnalysis;
+  }, [runAnalysis]);
 
-    // Perform initial analysis
-    await updateFloodRiskWithRealData();
+  // Re-analyze when the inputs that affect the result change
+  useEffect(() => {
+    if (!isActive) return;
+    runAnalysisRef.current();
+  }, [isActive, riverPath, predictionTime, riverSpeed, riverWidth]);
 
-    // Start real-time updates every 2 minutes
-    intervalRef.current = setInterval(() => {
-      updateFloodRiskWithRealData();
-    }, 120000); // Update every 2 minutes (to avoid overwhelming the tile server)
-  };
+  // Periodic refresh while monitoring (tiles update every 6h; poll gently)
+  useEffect(() => {
+    if (!isActive) return;
+    const id = setInterval(() => runAnalysisRef.current(), 120000);
+    return () => clearInterval(id);
+  }, [isActive]);
 
-  // Stop flood risk monitoring
   const stopMonitoring = () => {
     setIsActive(false);
-    setRiskZones(null);
-
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
-    }
-
-    // Clear risk zones from map
-    if (onFloodRiskUpdate) {
-      onFloodRiskUpdate(null);
-    }
+    setAnalysis(null);
+    setRainfall(null);
+    setStatusMessage("");
+    onFloodRiskUpdate?.(null);
   };
-
-  // Handle prediction time changes - reanalyze precipitation
-  useEffect(() => {
-    if (isActive && predictionTime !== undefined) {
-      // Re-analyze precipitation when prediction time changes
-      updateFloodRiskWithRealData();
-    }
-  }, [predictionTime, isActive, updateFloodRiskWithRealData]);
 
   return (
     <div className="flex flex-col gap-4 p-4 bg-white/80 backdrop-blur-md rounded-xl">
@@ -182,63 +98,90 @@ const FloodRiskManager = ({
         </div>
       ) : (
         <>
-          <div className="flex flex-col gap-2">
-            <div className="text-sm">
-              <div>River Path Length: {riverPath.length} points</div>
-              <div>Flow Velocity: {flowVelocity} m/s</div>
-              <div>Status: {isActive ? "Active" : "Inactive"}</div>
-              <div>
-                Prediction Time: {predictionTime}h{" "}
-                {predictionTime === "0" ? "(Current)" : "(Forecast)"}
-              </div>
+          <div className="flex flex-col gap-2 text-sm">
+            <label className="flex items-center justify-between gap-2">
+              <span>Avg. river speed (m/s)</span>
+              <input
+                type="number"
+                min="0.1"
+                step="0.1"
+                value={riverSpeed}
+                onChange={(e) => setRiverSpeed(e.target.value)}
+                className="w-24 px-2 py-1 border border-slate-300 rounded-md bg-white"
+              />
+            </label>
+            <label className="flex items-center justify-between gap-2">
+              <span>Avg. river width (m)</span>
+              <input
+                type="number"
+                min="1"
+                step="5"
+                value={riverWidth}
+                onChange={(e) => setRiverWidth(e.target.value)}
+                className="w-24 px-2 py-1 border border-slate-300 rounded-md bg-white"
+              />
+            </label>
+            <div className="text-xs text-gray-600">
+              Flushing capacity: {(Number(riverSpeed) * Number(riverWidth) || 0).toFixed(0)}{" "}
+              m³/s per meter of water-level rise
             </div>
 
-            {debugInfo && (
+            <div>
+              River path: {riverPath.length} points · Forecast: +
+              {predictionTime}h {Number(predictionTime) === 0 && "(now)"}
+            </div>
+
+            {statusMessage && (
               <div className="text-xs bg-gray-100 p-2 rounded">
-                <div className="font-medium">Debug Info:</div>
-                <div>{debugInfo}</div>
+                {statusMessage}
               </div>
             )}
 
-            {analysisStats && (
-              <div className="text-sm bg-blue-50 p-2 rounded">
-                <div className="font-medium text-blue-800">
-                  Precipitation Analysis
+            {rainfall && (
+              <div className="bg-blue-50 p-2 rounded">
+                <div className="font-medium text-blue-800">Precipitation</div>
+                <div>
+                  Raining on {rainfall.summary.rainingPoints}/
+                  {rainfall.summary.totalPoints} points
                 </div>
                 <div>
-                  Affected Segments: {analysisStats.affectedSegments}/
-                  {analysisStats.totalSegments}
+                  Max rate: {rainfall.summary.maxRate.toFixed(1)} mm/h · Avg:{" "}
+                  {rainfall.summary.averageRate.toFixed(1)} mm/h
                 </div>
                 <div>
-                  Max Intensity: {analysisStats.maxIntensity.toFixed(1)} mm/h
+                  Max accumulation next {rainfall.intervalHours}h:{" "}
+                  {rainfall.summary.maxAccumulationMm.toFixed(1)} mm
                 </div>
-                <div>
-                  Average Intensity: {analysisStats.averageIntensity.toFixed(1)}{" "}
-                  mm/h
-                </div>
-                {precipitationData?.timeOffsets && (
-                  <div className="text-xs text-gray-600">
-                    Comparing {precipitationData.timeOffsets.current}h vs{" "}
-                    {precipitationData.timeOffsets.reference}h
-                  </div>
-                )}
               </div>
             )}
 
-            {riskZones && (
-              <div className="text-sm bg-red-50 p-2 rounded">
-                <div className="font-medium text-red-800">Flood Risk Zones</div>
-                <div>Active Risk Zones: {riskZones.features.length}</div>
-                {riskZones.features.length > 0 && (
-                  <div className="text-xs text-gray-600">
-                    Risk Levels:{" "}
-                    {[
-                      ...new Set(
-                        riskZones.features.map((f) => f.properties.riskLevel)
-                      ),
-                    ].join(", ")}
-                  </div>
-                )}
+            {analysis && (
+              <div className="bg-red-50 p-2 rounded">
+                <div className="font-medium text-red-800">Hydrology</div>
+                <div>
+                  Peak storm discharge:{" "}
+                  {analysis.summary.peakDischargeM3s.toFixed(1)} m³/s
+                </div>
+                <div>
+                  Peak water-level rise: {analysis.summary.peakRiseM.toFixed(2)}{" "}
+                  m
+                </div>
+                <div>
+                  Rain volume reaching river:{" "}
+                  {Math.round(
+                    analysis.summary.totalRainVolumeM3
+                  ).toLocaleString()}{" "}
+                  m³
+                </div>
+                <div>
+                  At-risk points: {analysis.summary.floodedPoints}/
+                  {analysis.summary.totalPoints}
+                </div>
+                <div className="text-xs text-gray-600">
+                  Water travels the full path in{" "}
+                  {analysis.summary.pathTravelTimeH.toFixed(1)}h at{" "}
+                  {analysis.riverSpeed} m/s
+                </div>
               </div>
             )}
           </div>
@@ -246,7 +189,7 @@ const FloodRiskManager = ({
           <div className="flex gap-2">
             {!isActive ? (
               <button
-                onClick={startMonitoring}
+                onClick={() => setIsActive(true)}
                 className="bg-blue-500 text-white px-4 py-2 rounded text-sm hover:bg-blue-600"
               >
                 Start Monitoring
@@ -261,44 +204,13 @@ const FloodRiskManager = ({
             )}
 
             <button
-              onClick={updateFloodRiskWithRealData}
-              disabled={!isActive}
+              onClick={runAnalysis}
+              disabled={isAnalyzing}
               className="bg-green-500 text-white px-4 py-2 rounded text-sm hover:bg-green-600 disabled:bg-gray-300"
             >
-              Analyze Now
+              {isAnalyzing ? "Analyzing..." : "Analyze Now"}
             </button>
           </div>
-
-          {precipitationData && precipitationData.changes.length > 0 && (
-            <div className="border-t pt-2">
-              <div className="text-sm font-medium mb-2">
-                Recent Precipitation Changes
-              </div>
-              <div className="max-h-32 overflow-y-auto">
-                {precipitationData.changes.slice(0, 5).map((change, index) => (
-                  <div
-                    key={index}
-                    className="text-xs bg-orange-50 p-2 rounded mb-1"
-                  >
-                    <div>
-                      Segment {change.segmentIndex}:{" "}
-                      {change.currentIntensity.toFixed(1)} mm/h
-                    </div>
-                    <div className="text-gray-600">
-                      Change: +{change.intensityChange.toFixed(1)} mm/h
-                      {change.floodRadius &&
-                        ` • Radius: ${Math.round(change.floodRadius)}m`}
-                    </div>
-                  </div>
-                ))}
-                {precipitationData.changes.length > 5 && (
-                  <div className="text-xs text-gray-500">
-                    ...and {precipitationData.changes.length - 5} more changes
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
         </>
       )}
     </div>

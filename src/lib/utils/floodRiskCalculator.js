@@ -1,8 +1,31 @@
 // lib/utils/floodRiskCalculator.js
+//
+// Mass-balance flood model for a user-drawn river path.
+//
+// Rain falling on the strip of land draining into each river segment enters
+// the channel as lateral inflow:
+//
+//   Q_in = C * (R / 3.6e6) * L * Wc        [m³/s]
+//
+//     C  runoff coefficient (fraction of rain reaching the river)
+//     R  rain rate in mm/h  (R/3.6e6 converts mm/h -> m/s of water depth)
+//     L  segment length (m), Wc catchment strip width (m)
+//
+// That water is flushed downstream at the river's average speed v. The
+// discharge at a point is the sum of upstream inflows close enough for
+// their water to arrive within the forecast interval (travel time = d/v).
+//
+// A river of width w moving at v carries v*w m³/s for every meter of extra
+// depth, so the level rise needed to evacuate a storm discharge Q is:
+//
+//   Δh = Q / (v * w)                        [m]
+//
+// Δh is what we map to flood risk: if the river must rise further than its
+// banks allow, the surroundings flood.
 
-// Helper function for distance calculation
+// Haversine distance in meters
 function calculateDistance(lat1, lng1, lat2, lng2) {
-  const R = 6371e3; // Earth's radius in meters
+  const R = 6371e3;
   const φ1 = (lat1 * Math.PI) / 180;
   const φ2 = (lat2 * Math.PI) / 180;
   const Δφ = ((lat2 - lat1) * Math.PI) / 180;
@@ -16,358 +39,203 @@ function calculateDistance(lat1, lng1, lat2, lng2) {
   return R * c;
 }
 
+export const RISK_LEVELS = [
+  { level: "low", minRise: 0.1 },
+  { level: "moderate", minRise: 0.5 },
+  { level: "high", minRise: 1.5 },
+  { level: "extreme", minRise: 3.0 },
+];
+
 export class FloodRiskCalculator {
-  constructor(riverPath, flowVelocity = 18) {
-    // 18 m/s default
+  constructor(riverPath, options = {}) {
+    const {
+      riverSpeed = 1.5, // m/s — typical lowland river
+      riverWidth = 50, // m
+      runoffCoefficient = 0.5, // mixed terrain
+      catchmentWidth = 2000, // m of land draining into the river (both sides)
+    } = options;
+
     this.riverPath = riverPath;
-    this.flowVelocity = flowVelocity; // meters per second
-    this.precipitationData = new Map(); // Store precipitation data over time
-    this.waterParcels = []; // Track water parcels moving downstream
+    this.riverSpeed = Math.max(0.1, riverSpeed);
+    this.riverWidth = Math.max(1, riverWidth);
+    this.runoffCoefficient = Math.min(1, Math.max(0, runoffCoefficient));
+    this.catchmentWidth = Math.max(1, catchmentWidth);
   }
 
-  // Calculate cumulative distance along river path
+  // Cumulative distance (m) along the path at each point
   calculatePathDistances() {
-    if (this.riverPath.length < 2) return [];
+    if (this.riverPath.length < 2) return [0];
 
     const distances = [0];
-    let cumulativeDistance = 0;
-
     for (let i = 1; i < this.riverPath.length; i++) {
       const [lng1, lat1] = this.riverPath[i - 1];
       const [lng2, lat2] = this.riverPath[i];
-      const segmentDistance = calculateDistance(lat1, lng1, lat2, lng2);
-      cumulativeDistance += segmentDistance;
-      distances.push(cumulativeDistance);
+      distances.push(
+        distances[i - 1] + calculateDistance(lat1, lng1, lat2, lng2)
+      );
     }
-
     return distances;
   }
 
-  // Add precipitation data at a specific time
-  addPrecipitationData(timestamp, precipitationIntensity, affectedSegments) {
-    this.precipitationData.set(timestamp, {
-      intensity: precipitationIntensity,
-      segments: affectedSegments,
-    });
-
-    // Create water parcels for each affected segment
-    affectedSegments.forEach((segmentIndex) => {
-      if (segmentIndex < this.riverPath.length) {
-        this.waterParcels.push({
-          id: `${timestamp}-${segmentIndex}`,
-          originalSegment: segmentIndex,
-          currentPosition: this.getSegmentDistance(segmentIndex),
-          intensity: precipitationIntensity,
-          birthTime: timestamp,
-        });
-      }
-    });
-  }
-
-  // Get distance of a segment along the river path
-  getSegmentDistance(segmentIndex) {
-    const distances = this.calculatePathDistances();
-    return distances[segmentIndex] || 0;
-  }
-
-  // Calculate current water positions at given time
-  calculateWaterPositions(currentTime) {
-    const activeWaterParcels = [];
-
-    this.waterParcels.forEach((parcel) => {
-      const timeElapsed = (currentTime - parcel.birthTime) / 1000; // Convert to seconds
-      const distanceTraveled = this.flowVelocity * timeElapsed;
-      const currentPosition = parcel.currentPosition + distanceTraveled;
-
-      // Check if water parcel is still within the river path
-      const totalPathDistance = this.getTotalPathDistance();
-      if (currentPosition <= totalPathDistance) {
-        activeWaterParcels.push({
-          ...parcel,
-          currentPosition,
-          distanceTraveled,
-          timeElapsed,
-        });
-      }
-    });
-
-    return activeWaterParcels;
-  }
-
-  // Get total distance of the river path
   getTotalPathDistance() {
     const distances = this.calculatePathDistances();
     return distances[distances.length - 1] || 0;
   }
 
-  // Convert distance along path to geographic coordinates
-  distanceToCoordinates(distance) {
-    const distances = this.calculatePathDistances();
-
-    // Find the segment where this distance falls
-    for (let i = 0; i < distances.length - 1; i++) {
-      if (distance >= distances[i] && distance <= distances[i + 1]) {
-        const segmentStart = distances[i];
-        const segmentEnd = distances[i + 1];
-        const segmentDistance = segmentEnd - segmentStart;
-        const positionInSegment = distance - segmentStart;
-        const ratio = positionInSegment / segmentDistance;
-
-        // Interpolate coordinates
-        const [lng1, lat1] = this.riverPath[i];
-        const [lng2, lat2] = this.riverPath[i + 1];
-
-        const lng = lng1 + (lng2 - lng1) * ratio;
-        const lat = lat1 + (lat2 - lat1) * ratio;
-
-        return [lng, lat];
-      }
-    }
-
-    // If distance is beyond path, return last point
-    return this.riverPath[this.riverPath.length - 1];
+  // Flushing capacity: m³/s the river evacuates per meter of level rise
+  getFlushCapacityPerMeter() {
+    return this.riverSpeed * this.riverWidth;
   }
 
-  // Generate flood risk zones with dynamic radius along river path
-  generateFloodRiskZones(currentTime, precipitationData = null) {
-    const waterPositions = this.calculateWaterPositions(currentTime);
-    const riskZones = [];
+  riskLevelFromRise(riseM) {
+    let level = "none";
+    for (const { level: l, minRise } of RISK_LEVELS) {
+      if (riseM >= minRise) level = l;
+    }
+    return level;
+  }
 
-    waterPositions.forEach((parcel) => {
-      const coordinates = this.distanceToCoordinates(parcel.currentPosition);
+  // Flood radius around a river point: channel half-width plus spill
+  // proportional to the level rise.
+  floodRadiusFromRise(riseM) {
+    if (riseM < 0.1) return 0;
+    const radius = this.riverWidth / 2 + 800 * riseM;
+    return Math.max(50, Math.min(radius, 8000));
+  }
 
-      // Get current precipitation intensity at this position if available
-      let currentPrecipitation = 0;
-      if (precipitationData) {
-        const nearestSegment = this.findNearestSegmentIndex(
-          parcel.currentPosition
-        );
-        const precipData = precipitationData.find(
-          (p) => p.segmentIndex === nearestSegment
-        );
-        if (precipData) {
-          currentPrecipitation = precipData.intensity;
+  // Core computation. `rainfallPoints` is the per-point output of
+  // PrecipitationAnalyzer.analyzeRainfallAlongPath (rateNow/rateNext/
+  // accumulationMm per river path point); `intervalHours` is the time
+  // between the two sampled weather parcels.
+  analyze(rainfallPoints, intervalHours) {
+    const distances = this.calculatePathDistances();
+    const n = this.riverPath.length;
+    if (n < 2 || !rainfallPoints || rainfallPoints.length < n) {
+      return null;
+    }
+
+    const intervalSeconds = intervalHours * 3600;
+    const travelWindow = this.riverSpeed * intervalSeconds; // m upstream that can drain past a point within the interval
+
+    // Lateral inflow per segment, using the trapezoid-averaged rain rate
+    // over the interval ((rateNow + rateNext)/2 at both endpoints).
+    const segmentInflows = [];
+    for (let i = 0; i < n - 1; i++) {
+      const length = distances[i + 1] - distances[i];
+      const rateA =
+        (rainfallPoints[i].rateNow + rainfallPoints[i].rateNext) / 2;
+      const rateB =
+        (rainfallPoints[i + 1].rateNow + rainfallPoints[i + 1].rateNext) / 2;
+      const meanRate = (rateA + rateB) / 2; // mm/h over the segment
+      const inflow =
+        this.runoffCoefficient *
+        (meanRate / 3.6e6) *
+        length *
+        this.catchmentWidth; // m³/s
+      segmentInflows.push({
+        // Lateral inflow is spread along the segment; treat it as entering
+        // at the midpoint for routing purposes.
+        entryDistance: distances[i] + length / 2,
+        inflow,
+        meanRate,
+        length,
+      });
+    }
+
+    const flushPerMeter = this.getFlushCapacityPerMeter();
+
+    const points = rainfallPoints.map((rain, i) => {
+      const distance = distances[i];
+
+      // Storm discharge: upstream inflows whose water reaches this point
+      // within the forecast interval
+      let discharge = 0;
+      for (const seg of segmentInflows) {
+        if (
+          seg.entryDistance <= distance &&
+          distance - seg.entryDistance <= travelWindow
+        ) {
+          discharge += seg.inflow;
         }
       }
 
-      // Calculate dynamic radius based on both historical and current precipitation
-      const historicalIntensity = parcel.intensity;
-      const effectiveIntensity = Math.max(
-        historicalIntensity,
-        currentPrecipitation
-      );
-      const radius = this.calculateDynamicRadius(
-        effectiveIntensity,
-        coordinates
-      );
-
-      // Create buffer around water position with dynamic radius
-      const bufferFeature = this.createCircularBuffer(coordinates, radius);
-
-      riskZones.push({
-        type: "Feature",
-        properties: {
-          parcelId: parcel.id,
-          historicalIntensity: historicalIntensity,
-          currentIntensity: currentPrecipitation,
-          effectiveIntensity: effectiveIntensity,
-          radius: radius,
-          timeElapsed: parcel.timeElapsed,
-          riskLevel: this.calculateRiskLevel(effectiveIntensity),
-          segmentIndex: this.findNearestSegmentIndex(parcel.currentPosition),
-        },
-        geometry: bufferFeature.geometry,
-      });
+      const riseM = discharge / flushPerMeter;
+      return {
+        segmentIndex: i,
+        coordinates: rain.coordinates,
+        distanceAlongPath: distance,
+        rateNow: rain.rateNow,
+        rateNext: rain.rateNext,
+        accumulationMm: rain.accumulationMm,
+        dischargeM3s: discharge,
+        riseM,
+        riskLevel: this.riskLevelFromRise(riseM),
+        floodRadius: this.floodRadiusFromRise(riseM),
+      };
     });
 
-    return {
-      type: "FeatureCollection",
-      features: riskZones,
-    };
-  }
-
-  // Calculate dynamic radius based on precipitation intensity and location factors
-  calculateDynamicRadius(intensity, coordinates, baseRadius = 500) {
-    // Base radius scaling by precipitation intensity
-    let radiusMultiplier = 1;
-
-    if (intensity <= 0.2) return 0; // No flood risk
-    if (intensity <= 0.5) radiusMultiplier = 0.3;
-    else if (intensity <= 1.0) radiusMultiplier = 0.6;
-    else if (intensity <= 2.0) radiusMultiplier = 1.0;
-    else if (intensity <= 5.0) radiusMultiplier = 1.5;
-    else if (intensity <= 10.0) radiusMultiplier = 2.5;
-    else if (intensity <= 20.0) radiusMultiplier = 4.0;
-    else if (intensity <= 50.0) radiusMultiplier = 6.0;
-    else radiusMultiplier = 8.0; // Extreme precipitation >50mm/h
-
-    // Additional factors that could affect radius:
-    // - Terrain slope (flatter areas = larger radius)
-    // - Distance from source (accumulation effect)
-    // - Soil saturation level
-    // - Channel capacity
-
-    const dynamicRadius = baseRadius * radiusMultiplier;
-
-    // Minimum and maximum radius constraints
-    return Math.max(100, Math.min(dynamicRadius, 5000));
-  }
-
-  // Find nearest segment index based on distance along path
-  findNearestSegmentIndex(distanceAlongPath) {
-    const distances = this.calculatePathDistances();
-
-    for (let i = 0; i < distances.length - 1; i++) {
-      if (
-        distanceAlongPath >= distances[i] &&
-        distanceAlongPath <= distances[i + 1]
-      ) {
-        return i;
-      }
-    }
-
-    return Math.max(0, distances.length - 2);
-  }
-
-  // Generate static flood risk zones along entire river path based on current precipitation
-  generateStaticRiskZonesAlongPath(precipitationData, baseRadius = 500) {
-    if (!precipitationData || precipitationData.length === 0) {
-      return {
-        type: "FeatureCollection",
-        features: [],
-      };
-    }
-
-    const staticZones = [];
-
-    // Create risk zones for each river segment with precipitation
-    for (let i = 0; i < this.riverPath.length - 1; i++) {
-      const precipData = precipitationData.find((p) => p.segmentIndex === i);
-
-      if (precipData && precipData.intensity > 0.2) {
-        const startCoord = this.riverPath[i];
-        const endCoord = this.riverPath[i + 1];
-
-        // Calculate dynamic radius for this segment
-        const radius = this.calculateDynamicRadius(
-          precipData.intensity,
-          startCoord,
-          baseRadius
-        );
-
-        // Create buffer zones along the segment
-        const segmentLength = this.calculateSegmentDistance(i);
-        const numPoints = Math.max(3, Math.floor(segmentLength / 200)); // Point every 200m minimum
-
-        for (let j = 0; j < numPoints; j++) {
-          const ratio = j / (numPoints - 1);
-          const lng = startCoord[0] + (endCoord[0] - startCoord[0]) * ratio;
-          const lat = startCoord[1] + (endCoord[1] - startCoord[1]) * ratio;
-          const coordinates = [lng, lat];
-
-          // Vary radius slightly along segment for more natural appearance
-          const radiusVariation = 1 + Math.sin(ratio * Math.PI) * 0.2; // ±20% variation
-          const adjustedRadius = radius * radiusVariation;
-
-          const bufferFeature = this.createCircularBuffer(
-            coordinates,
-            adjustedRadius
-          );
-
-          staticZones.push({
-            type: "Feature",
-            properties: {
-              segmentIndex: i,
-              pointIndex: j,
-              intensity: precipData.intensity,
-              radius: adjustedRadius,
-              riskLevel: this.calculateRiskLevel(precipData.intensity),
-              isStatic: true,
-              coordinates: coordinates,
-            },
-            geometry: bufferFeature.geometry,
-          });
-        }
-      }
-    }
-
-    return {
-      type: "FeatureCollection",
-      features: staticZones,
-    };
-  }
-
-  // Calculate distance of a specific segment
-  calculateSegmentDistance(segmentIndex) {
-    if (segmentIndex >= this.riverPath.length - 1) return 0;
-
-    const [lng1, lat1] = this.riverPath[segmentIndex];
-    const [lng2, lat2] = this.riverPath[segmentIndex + 1];
-    return calculateDistance(lat1, lng1, lat2, lng2);
-  }
-
-  // Generate combined flood risk zones (both moving water and static precipitation zones)
-  generateCombinedFloodRiskZones(currentTime, precipitationData = null) {
-    const movingWaterZones = this.generateFloodRiskZones(
-      currentTime,
-      precipitationData
+    const totalRainVolume = segmentInflows.reduce(
+      (sum, seg) => sum + seg.inflow * intervalSeconds,
+      0
     );
-    const staticPrecipZones = precipitationData
-      ? this.generateStaticRiskZonesAlongPath(precipitationData)
-      : { type: "FeatureCollection", features: [] };
 
     return {
-      type: "FeatureCollection",
-      features: [...staticPrecipZones.features, ...movingWaterZones.features],
+      points,
+      intervalHours,
+      riverSpeed: this.riverSpeed,
+      riverWidth: this.riverWidth,
+      summary: {
+        peakDischargeM3s: Math.max(...points.map((p) => p.dischargeM3s)),
+        peakRiseM: Math.max(...points.map((p) => p.riseM)),
+        floodedPoints: points.filter((p) => p.riseM >= 0.1).length,
+        totalPoints: points.length,
+        totalRainVolumeM3: totalRainVolume,
+        flushCapacityPerMeterRise: flushPerMeter,
+        pathTravelTimeH: this.getTotalPathDistance() / this.riverSpeed / 3600,
+      },
     };
   }
 
-  // Create circular buffer around a point
-  createCircularBuffer(center, radiusInMeters) {
-    const points = 32;
+  // GeoJSON flood risk zones for the map, one buffer per at-risk point
+  generateFloodRiskZones(analysis) {
+    if (!analysis) {
+      return { type: "FeatureCollection", features: [] };
+    }
+
+    const features = analysis.points
+      .filter((p) => p.floodRadius > 0)
+      .map((p) => ({
+        type: "Feature",
+        properties: {
+          segmentIndex: p.segmentIndex,
+          riskLevel: p.riskLevel,
+          riseM: p.riseM,
+          dischargeM3s: p.dischargeM3s,
+          accumulationMm: p.accumulationMm,
+          radius: p.floodRadius,
+        },
+        geometry: this.createCircularBuffer(p.coordinates, p.floodRadius),
+      }));
+
+    return { type: "FeatureCollection", features };
+  }
+
+  // Circular polygon around [lng, lat] with radius in meters
+  createCircularBuffer(center, radiusInMeters, points = 32) {
     const coords = [];
-    const earthRadius = 6371000; // Earth's radius in meters
+    const earthRadius = 6371000;
+    const latOffset = (radiusInMeters / earthRadius) * (180 / Math.PI);
+    const lngOffset = latOffset / Math.cos((center[1] * Math.PI) / 180);
 
     for (let i = 0; i < points; i++) {
       const angle = (i * 2 * Math.PI) / points;
-      const latOffset = (radiusInMeters / earthRadius) * (180 / Math.PI);
-      const lngOffset =
-        ((radiusInMeters / earthRadius) * (180 / Math.PI)) /
-        Math.cos((center[1] * Math.PI) / 180);
-
-      const lat = center[1] + latOffset * Math.cos(angle);
-      const lng = center[0] + lngOffset * Math.sin(angle);
-
-      coords.push([lng, lat]);
+      coords.push([
+        center[0] + lngOffset * Math.sin(angle),
+        center[1] + latOffset * Math.cos(angle),
+      ]);
     }
-
-    // Close the polygon
     coords.push(coords[0]);
 
-    return {
-      type: "Polygon",
-      coordinates: [coords],
-    };
-  }
-
-  // Calculate risk level based on intensity
-  calculateRiskLevel(intensity) {
-    if (intensity < 1.0) return "low";
-    if (intensity < 5.0) return "moderate";
-    if (intensity < 20.0) return "high";
-    return "extreme";
-  }
-
-  // Clean up old water parcels that have moved past the river end
-  cleanupOldParcels(currentTime) {
-    const totalDistance = this.getTotalPathDistance();
-
-    this.waterParcels = this.waterParcels.filter((parcel) => {
-      const timeElapsed = (currentTime - parcel.birthTime) / 1000;
-      const distanceTraveled = this.flowVelocity * timeElapsed;
-      const currentPosition = parcel.currentPosition + distanceTraveled;
-
-      return currentPosition <= totalDistance;
-    });
+    return { type: "Polygon", coordinates: [coords] };
   }
 }

@@ -1,6 +1,6 @@
 import { Map } from "@vis.gl/react-maplibre";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import MapTools from "./components/MapTools.jsx";
 import RiverPathControls from "./components/controls/RiverPathControl.jsx";
 import FloodRiskManager from "./components/FloodRiskManager.jsx"; // Add this import
@@ -14,8 +14,10 @@ import {
 
 function App() {
   const centerPanama = [9.001167, -79.507581];
-  const [predictionTime, setPredictionTime] = useState("0");
-  const [rainOpacity, setRainOpacity] = useState(0.3);
+  const [predictionTime, setPredictionTime] = useState(0);
+  const [rainOpacity, setRainOpacity] = useState(0);
+  const [riverSpeed, setRiverSpeed] = useState(1.5); // m/s
+  const [riverWidth, setRiverWidth] = useState(50); // m
   const [riverPath, setRiverPath] = useState([]);
   const [savedPaths, setSavedPaths] = useState([]);
   const [controlsOpen, setControlsOpen] = useState(true);
@@ -79,10 +81,11 @@ function App() {
     }
   };
 
-  // Handle flood risk updates from FloodRiskManager
-  const handleFloodRiskUpdate = (riskZones) => {
+  // Handle flood risk updates from FloodRiskManager (stable identity so the
+  // manager's analysis effect doesn't re-fire on every App render)
+  const handleFloodRiskUpdate = useCallback((riskZones) => {
     setFloodRiskZones(riskZones);
-  };
+  }, []);
 
   // Generate map style with river path and flood risk zones
   const mapStyle = createMapStyle({
@@ -142,7 +145,10 @@ function App() {
               riverPath={riverPath}
               predictionTime={predictionTime}
               onFloodRiskUpdate={handleFloodRiskUpdate}
-              flowVelocity={18} // 18 m/s as you specified
+              riverSpeed={riverSpeed}
+              setRiverSpeed={setRiverSpeed}
+              riverWidth={riverWidth}
+              setRiverWidth={setRiverWidth}
             />
           </div>
         )}

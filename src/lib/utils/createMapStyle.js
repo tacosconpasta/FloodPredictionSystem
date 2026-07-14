@@ -2,6 +2,7 @@ export const createMapStyle = ({
   predictionTime,
   rainOpacity,
   riverPath = [],
+  floodRiskZones = null,
 }) => {
   const baseStyle = {
     version: 8,
@@ -27,6 +28,10 @@ export const createMapStyle = ({
           `https://weather.openportguide.de/tiles/actual/precipitation_shaded/${predictionTime}h/{z}/{x}/{y}.png`,
         ],
         tileSize: 256,
+        // The weather tile server only publishes zooms 0-7; deeper requests
+        // 404 (and the 404 page lacks CORS headers). MapLibre overzooms
+        // the z7 tiles beyond this.
+        maxzoom: 7,
         attribution: "© OpenPortGuide.de",
       },
     },
@@ -43,7 +48,7 @@ export const createMapStyle = ({
         paint: {
           "hillshade-shadow-color": "#444",
           "hillshade-highlight-color": "#fff",
-          "hillshade-exaggeration": 0.5,
+          "hillshade-exaggeration": 0.1,
         },
       },
       {
@@ -60,6 +65,50 @@ export const createMapStyle = ({
       exaggeration: 4,
     },
   };
+
+  // Add flood risk zones (rendered below the river path)
+  if (floodRiskZones && floodRiskZones.features?.length > 0) {
+    baseStyle.sources.floodRiskZones = {
+      type: "geojson",
+      data: floodRiskZones,
+    };
+
+    const riskColor = [
+      "match",
+      ["get", "riskLevel"],
+      "low",
+      "#fbbf24", // amber
+      "moderate",
+      "#f97316", // orange
+      "high",
+      "#ef4444", // red
+      "extreme",
+      "#7f1d1d", // dark red
+      "#94a3b8", // fallback slate
+    ];
+
+    baseStyle.layers.push(
+      {
+        id: "flood-risk-fill",
+        type: "fill",
+        source: "floodRiskZones",
+        paint: {
+          "fill-color": riskColor,
+          "fill-opacity": 0.35,
+        },
+      },
+      {
+        id: "flood-risk-outline",
+        type: "line",
+        source: "floodRiskZones",
+        paint: {
+          "line-color": riskColor,
+          "line-width": 1.5,
+          "line-opacity": 0.8,
+        },
+      }
+    );
+  }
 
   // Add river path if it exists
   if (riverPath && riverPath.length > 0) {

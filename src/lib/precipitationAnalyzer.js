@@ -1,17 +1,84 @@
-// lib/utils/precipitationAnalyzer.js
+// lib/precipitationAnalyzer.js
+//
+// Reads precipitation rates from the public weather.openportguide.de
+// "precipitation_shaded" raster tiles and estimates accumulated rainfall
+// between consecutive forecast parcels.
+//
+// Color scale (official legend, verified 2026-07 by pixel-sampling live
+// tiles — tiles contain exactly these RGBA values, no anti-aliasing):
+//
+//   RGB              rate (mm/h)
+//   0,255,255        >= 0.1
+//   0,204,255        >= 0.2
+//   0,153,255        >= 0.4
+//   0,102,255        >= 0.7
+//   0,51,255         >= 1
+//   0,0,215          >= 2
+//   0,0,139          >= 4
+//   128,0,128        >= 7
+//   173,0,173        >= 10
+//   219,0,219        >= 20
+//   252,88,252       >= 40
+//   252,151,252      >= 70
+//   transparent      < 0.1 (treated as 0)
+//
+// Units are mm/m²·h (= liters/m²/h = mm/h). Each tile is a forward-looking
+// average: the 0h and 6h timesteps average the next 6 hours, the 12h+
+// timesteps average the next 12 hours.
+
+// Forecast timesteps published by the free tile service.
+export const AVAILABLE_TIMESTEPS = [0, 6, 12, 24, 36, 48, 60, 72];
+
+// Deepest zoom the tile server publishes; z8+ returns 404. One z7 pixel is
+// ~1.2 km at the equator, well below the ~25 km resolution of the
+// underlying GFS forecast, so nothing is lost sampling at z7.
+export const MAX_TILE_ZOOM = 7;
+
+// Each bucket spans [minRate, maxRate) mm/h; `rate` is the midpoint used as
+// the representative value. The open-ended top bucket is capped at 100 mm/h.
+export const PRECIPITATION_COLOR_SCALE = [
+  { rgb: [0, 255, 255], minRate: 0.1, maxRate: 0.2 },
+  { rgb: [0, 204, 255], minRate: 0.2, maxRate: 0.4 },
+  { rgb: [0, 153, 255], minRate: 0.4, maxRate: 0.7 },
+  { rgb: [0, 102, 255], minRate: 0.7, maxRate: 1.0 },
+  { rgb: [0, 51, 255], minRate: 1.0, maxRate: 2.0 },
+  { rgb: [0, 0, 215], minRate: 2.0, maxRate: 4.0 },
+  { rgb: [0, 0, 139], minRate: 4.0, maxRate: 7.0 },
+  { rgb: [128, 0, 128], minRate: 7.0, maxRate: 10.0 },
+  { rgb: [173, 0, 173], minRate: 10.0, maxRate: 20.0 },
+  { rgb: [219, 0, 219], minRate: 20.0, maxRate: 40.0 },
+  { rgb: [252, 88, 252], minRate: 40.0, maxRate: 70.0 },
+  { rgb: [252, 151, 252], minRate: 70.0, maxRate: 100.0 },
+].map((bucket) => ({
+  ...bucket,
+  rate: (bucket.minRate + bucket.maxRate) / 2,
+}));
+
+// Hours each timestep's tile averages over (server definition).
+export const getAveragingWindowHours = (timeOffset) =>
+  timeOffset <= 6 ? 6 : 12;
+
+// Next published parcel after the given one (e.g. 0 -> 6, 6 -> 12, 72 -> null).
+export const getNextTimestep = (timeOffset) => {
+  const next = AVAILABLE_TIMESTEPS.find((t) => t > timeOffset);
+  return next !== undefined ? next : null;
+};
+
+// Accumulated rainfall depth (mm) over `hours` given the rain rate at the
+// start and end of the interval, via the trapezoidal rule:
+//
+//   depth = hours * (rateStart + rateEnd) / 2
+//
+// With 1h parcels this integrates the rate curve directly. With the current
+// 6h parcels — which are already forward averages — it blends the two
+// parcels' estimates of the interval, damping the error from rain that
+// starts/stops mid-window.
+export const estimateAccumulatedRainfall = (rateStart, rateEnd, hours) =>
+  (hours * (rateStart + rateEnd)) / 2;
 
 export class PrecipitationAnalyzer {
   constructor() {
-    this.precipitationRanges = [
-      { hslRange: [0, 179], intensity: 0.0 },
-      { hslRange: [179, 180], intensity: 0.2 },
-      { hslRange: [188, 198], intensity: 0.4 },
-      { hslRange: [199, 210], intensity: 0.7 },
-      { hslRange: [210, 218], intensity: 1.0 },
-      { hslRange: [218, 228], intensity: 2.0 },
-      { hslRange: [229, 239], intensity: 5.5 },
-      { hslRange: [300, 300], intensity: { min: 7, max: 70 } }, // Special case for hue 300
-    ];
+    this.tileCache = new Map(); // "offset-z-x-y" -> decoded tile
   }
 
   // Convert latitude/longitude to tile coordinates
@@ -25,7 +92,7 @@ export class PrecipitationAnalyzer {
     return { x, y, z: zoom };
   }
 
-  // Convert tile coordinates to pixel coordinates within the tile
+  // Convert lat/lng to pixel coordinates within the tile
   latLngToPixel(lat, lng, tileX, tileY, zoom, tileSize = 256) {
     const scale = tileSize * Math.pow(2, zoom);
     const worldX = ((lng + 180) / 360) * scale;
@@ -44,104 +111,67 @@ export class PrecipitationAnalyzer {
     return { x: pixelX, y: pixelY };
   }
 
-  // Convert RGB to HSL
-  rgbToHsl(r, g, b) {
-    r /= 255;
-    g /= 255;
-    b /= 255;
+  // Map a pixel color to a precipitation rate (mm/h). Tiles use the exact
+  // legend palette, so try an exact match first; fall back to
+  // nearest-neighbor in RGB space for resampled pixels.
+  rateFromColor(r, g, b, a) {
+    if (a < 128) return 0; // transparent = no measurable rain
 
-    const max = Math.max(r, g, b);
-    const min = Math.min(r, g, b);
-    let h, s, l;
-
-    l = (max + min) / 2;
-
-    if (max === min) {
-      h = s = 0; // achromatic
-    } else {
-      const d = max - min;
-      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-
-      switch (max) {
-        case r:
-          h = (g - b) / d + (g < b ? 6 : 0);
-          break;
-        case g:
-          h = (b - r) / d + 2;
-          break;
-        case b:
-          h = (r - g) / d + 4;
-          break;
-      }
-      h /= 6;
-    }
-
-    return {
-      h: Math.round(h * 360),
-      s: Math.round(s * 100),
-      l: Math.round(l * 100),
-    };
-  }
-
-  // Determine precipitation intensity from HSL values
-  getIntensityFromHsl(h, s, l) {
-    // Special case for hue 300 (magenta range)
-    if (h >= 295 && h <= 305) {
-      if (l < 25) return 7; // Bottom ceiling
-      // Linear interpolation between 7 and 70 based on luminosity
-      const intensityRange = 70 - 7;
-      const luminosityFactor = Math.max(0, (l - 25) / (100 - 25));
-      return 7 + intensityRange * luminosityFactor;
-    }
-
-    // Check other ranges
-    for (const range of this.precipitationRanges) {
-      const [minHue, maxHue] = range.hslRange;
-      if (h >= minHue && h <= maxHue) {
-        return typeof range.intensity === "number"
-          ? range.intensity
-          : range.intensity.min;
+    let best = null;
+    let bestDist = Infinity;
+    for (const bucket of PRECIPITATION_COLOR_SCALE) {
+      const [br, bg, bb] = bucket.rgb;
+      const dist = (r - br) ** 2 + (g - bg) ** 2 + (b - bb) ** 2;
+      if (dist === 0) return bucket.rate;
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = bucket;
       }
     }
 
-    return 0; // No precipitation
+    // An opaque pixel far from every legend color is not rain data
+    // (border artifacts, attribution text, etc.)
+    return bestDist <= 60 * 60 ? best.rate : 0;
   }
 
-  // Fetch and analyze precipitation tile
-  async fetchAndAnalyzeTile(tileUrl) {
+  // Fetch and decode a precipitation tile (cached per analyzer instance)
+  async getTile(timeOffset, tile) {
+    const key = `${timeOffset}-${tile.z}-${tile.x}-${tile.y}`;
+    if (this.tileCache.has(key)) return this.tileCache.get(key);
+
+    const url = `https://weather.openportguide.de/tiles/actual/precipitation_shaded/${timeOffset}h/${tile.z}/${tile.x}/${tile.y}.png`;
     try {
-      const response = await fetch(tileUrl);
+      const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`Failed to fetch tile: ${response.status}`);
       }
-
       const blob = await response.blob();
-      return await this.analyzeTileImage(blob);
+      const tileData = await this.decodeTileImage(blob);
+      this.tileCache.set(key, tileData);
+      return tileData;
     } catch (error) {
-      console.error("Error fetching precipitation tile:", error);
+      console.error(`Error fetching precipitation tile ${url}:`, error);
       return null;
     }
   }
 
-  // Analyze tile image to extract precipitation data
-  async analyzeTileImage(imageBlob) {
+  // Decode a tile image blob to raw pixel data
+  async decodeTileImage(imageBlob) {
     return new Promise((resolve, reject) => {
       const img = new Image();
-      img.crossOrigin = "anonymous";
+      const objectUrl = URL.createObjectURL(imageBlob);
 
       img.onload = () => {
+        URL.revokeObjectURL(objectUrl);
         const canvas = document.createElement("canvas");
         const ctx = canvas.getContext("2d");
-
         canvas.width = img.width;
         canvas.height = img.height;
-
         ctx.drawImage(img, 0, 0);
 
         try {
-          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
           resolve({
-            imageData: imageData,
+            imageData: ctx.getImageData(0, 0, canvas.width, canvas.height),
             width: canvas.width,
             height: canvas.height,
           });
@@ -150,333 +180,104 @@ export class PrecipitationAnalyzer {
         }
       };
 
-      img.onerror = () => reject(new Error("Failed to load image"));
-      img.src = URL.createObjectURL(imageBlob);
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Failed to load image"));
+      };
+      img.src = objectUrl;
     });
   }
 
-  // Get precipitation intensity at specific pixel coordinates
-  getPixelIntensity(imageData, x, y, width) {
-    if (x < 0 || x >= width || y < 0 || y >= imageData.height) {
-      return 0;
-    }
+  // Precipitation rate (mm/h) at pixel coordinates within a decoded tile
+  getPixelRate(tileData, x, y) {
+    const { imageData, width, height } = tileData;
+    if (x < 0 || x >= width || y < 0 || y >= height) return 0;
 
     const index = (y * width + x) * 4;
-    const r = imageData.data[index];
-    const g = imageData.data[index + 1];
-    const b = imageData.data[index + 2];
-    const a = imageData.data[index + 3];
-
-    // Skip transparent pixels
-    if (a < 128) return 0;
-
-    const hsl = this.rgbToHsl(r, g, b);
-    return this.getIntensityFromHsl(hsl.h, hsl.s, hsl.l);
+    return this.rateFromColor(
+      imageData.data[index],
+      imageData.data[index + 1],
+      imageData.data[index + 2],
+      imageData.data[index + 3]
+    );
   }
 
-  // Analyze precipitation along river path
-  async analyzePrecipitationAlongPath(riverPath, timeOffset = 0, zoom = 10) {
-    const precipitationData = [];
-    const tileCache = new Map();
+  // Sample the rain rate (mm/h) at each river path point for one timestep
+  async sampleRatesAlongPath(riverPath, timeOffset = 0, zoom = MAX_TILE_ZOOM) {
+    const clampedZoom = Math.min(zoom, MAX_TILE_ZOOM);
+    const rates = [];
 
-    for (let i = 0; i < riverPath.length; i++) {
-      const [lng, lat] = riverPath[i];
-      const tile = this.latLngToTile(lat, lng, zoom);
-      const tileKey = `${tile.z}-${tile.x}-${tile.y}`;
-
-      // Check if we already have this tile
-      let tileData = tileCache.get(tileKey);
+    for (const [lng, lat] of riverPath) {
+      const tile = this.latLngToTile(lat, lng, clampedZoom);
+      const tileData = await this.getTile(timeOffset, tile);
 
       if (!tileData) {
-        // Fetch and analyze new tile
-        const tileUrl = `https://weather.openportguide.de/tiles/actual/precipitation_shaded/${timeOffset}h/${tile.z}/${tile.x}/${tile.y}.png`;
-        tileData = await this.fetchAndAnalyzeTile(tileUrl);
-
-        if (tileData) {
-          tileCache.set(tileKey, tileData);
-        } else {
-          console.warn(`Failed to fetch tile for point ${i}`);
-          continue;
-        }
+        rates.push(null); // tile unavailable — distinguish from "no rain"
+        continue;
       }
 
-      if (tileData) {
-        // Get pixel coordinates within the tile
-        const pixel = this.latLngToPixel(lat, lng, tile.x, tile.y, zoom);
-
-        // Get precipitation intensity at this pixel
-        const intensity = this.getPixelIntensity(
-          tileData.imageData,
-          pixel.x,
-          pixel.y,
-          tileData.width
-        );
-
-        precipitationData.push({
-          segmentIndex: i,
-          coordinates: [lng, lat],
-          intensity: intensity,
-          tile: tile,
-          pixel: pixel,
-        });
-      }
+      const pixel = this.latLngToPixel(lat, lng, tile.x, tile.y, clampedZoom);
+      rates.push(this.getPixelRate(tileData, pixel.x, pixel.y));
     }
 
-    return precipitationData;
+    return rates;
   }
 
-  // Calculate average precipitation intensity along path segments
-  calculateSegmentIntensities(precipitationData) {
-    if (precipitationData.length === 0) return [];
+  // Main analysis: sample the parcel at `timeOffset` and the next published
+  // parcel at every river point, and estimate the rainfall accumulated on
+  // that spot across the interval between them.
+  async analyzeRainfallAlongPath(riverPath, timeOffset = 0, zoom = MAX_TILE_ZOOM) {
+    const startOffset = AVAILABLE_TIMESTEPS.includes(timeOffset)
+      ? timeOffset
+      : 0;
+    const nextOffset = getNextTimestep(startOffset);
+    const intervalHours =
+      nextOffset !== null
+        ? nextOffset - startOffset
+        : getAveragingWindowHours(startOffset);
 
-    const segments = [];
-
-    for (let i = 0; i < precipitationData.length - 1; i++) {
-      const current = precipitationData[i];
-      const next = precipitationData[i + 1];
-
-      const avgIntensity = (current.intensity + next.intensity) / 2;
-
-      segments.push({
-        segmentIndex: i,
-        startCoord: current.coordinates,
-        endCoord: next.coordinates,
-        startIntensity: current.intensity,
-        endIntensity: next.intensity,
-        averageIntensity: avgIntensity,
-        maxIntensity: Math.max(current.intensity, next.intensity),
-      });
-    }
-
-    return segments;
-  }
-
-  // Get affected segments based on intensity threshold
-  getAffectedSegments(precipitationData, minIntensity = 0.5) {
-    const segments = this.calculateSegmentIntensities(precipitationData);
-
-    return segments
-      .filter((segment) => segment.maxIntensity >= minIntensity)
-      .map((segment) => ({
-        segmentIndex: segment.segmentIndex,
-        intensity: segment.maxIntensity,
-        coordinates: segment.startCoord,
-      }));
-  }
-
-  // Calculate flood risk radius based on precipitation intensity with enhanced scaling
-  calculateFloodRadius(intensity, baseRadius = 500, coordinates = null) {
-    // Enhanced exponential scaling for flood radius based on precipitation intensity
-    if (intensity <= 0.2) return 0;
-
-    let radiusMultiplier;
-    if (intensity <= 0.5) radiusMultiplier = 0.4;
-    else if (intensity <= 1.0) radiusMultiplier = 0.7;
-    else if (intensity <= 2.0) radiusMultiplier = 1.0;
-    else if (intensity <= 5.0) radiusMultiplier = 1.6;
-    else if (intensity <= 10.0) radiusMultiplier = 2.8;
-    else if (intensity <= 20.0) radiusMultiplier = 4.5;
-    else if (intensity <= 50.0) radiusMultiplier = 7.0;
-    else radiusMultiplier = 10.0; // Extreme precipitation >50mm/h
-
-    // Additional location-based factors could be added here:
-    // - Terrain slope analysis
-    // - Proximity to confluence points
-    // - Historical flood data
-    // - Soil absorption capacity
-
-    const calculatedRadius = baseRadius * radiusMultiplier;
-
-    // Apply practical constraints
-    return Math.max(50, Math.min(calculatedRadius, 8000)); // 50m to 8km range
-  }
-
-  // Compare precipitation between current predictionTime and a reference time
-  async comparePrecipitationData(
-    riverPath,
-    currentTimeOffset,
-    referenceTimeOffset = 0,
-    zoom = 10
-  ) {
-    console.log(
-      `Comparing precipitation: ${currentTimeOffset}h vs ${referenceTimeOffset}h`
-    );
-
-    const [currentData, referenceData] = await Promise.all([
-      this.analyzePrecipitationAlongPath(riverPath, currentTimeOffset, zoom),
-      this.analyzePrecipitationAlongPath(riverPath, referenceTimeOffset, zoom),
+    const [ratesNow, ratesNext] = await Promise.all([
+      this.sampleRatesAlongPath(riverPath, startOffset, zoom),
+      nextOffset !== null
+        ? this.sampleRatesAlongPath(riverPath, nextOffset, zoom)
+        : Promise.resolve(riverPath.map(() => null)),
     ]);
 
-    const changes = [];
-
-    for (
-      let i = 0;
-      i < Math.min(currentData.length, referenceData.length);
-      i++
-    ) {
-      const current = currentData[i];
-      const reference = referenceData[i];
-
-      const intensityChange = current.intensity - reference.intensity;
-
-      if (intensityChange > 0.5 || current.intensity > 1.0) {
-        // Significant increase OR high current intensity
-        const floodRadius = this.calculateFloodRadius(
-          current.intensity,
-          500,
-          current.coordinates
-        );
-
-        changes.push({
-          segmentIndex: i,
-          coordinates: current.coordinates,
-          referenceIntensity: reference.intensity,
-          currentIntensity: current.intensity,
-          intensityChange: intensityChange,
-          floodRadius: floodRadius,
-          riskLevel: this.determineRiskLevel(current.intensity),
-          timestamp: Date.now(),
-          timeOffset: currentTimeOffset,
-        });
-      }
-    }
-
-    return {
-      currentData,
-      referenceData,
-      changes,
-      timeOffsets: {
-        current: currentTimeOffset,
-        reference: referenceTimeOffset,
-      },
-      summary: {
-        totalSegments: currentData.length,
-        affectedSegments: changes.length,
-        maxIntensity: Math.max(...currentData.map((d) => d.intensity)),
-        averageIntensity:
-          currentData.reduce((sum, d) => sum + d.intensity, 0) /
-          currentData.length,
-      },
-    };
-  }
-
-  // Determine risk level based on precipitation intensity
-  determineRiskLevel(intensity) {
-    if (intensity < 1.0) return "low";
-    if (intensity < 5.0) return "moderate";
-    if (intensity < 20.0) return "high";
-    return "extreme";
-  }
-
-  // Generate detailed flood risk zones along river path
-  generateRiverPathFloodZones(precipitationData, baseRadius = 500) {
-    const floodZones = [];
-
-    precipitationData.forEach((data) => {
-      if (data.intensity > 0.2) {
-        // Only create zones for significant precipitation
-        const radius = this.calculateFloodRadius(
-          data.intensity,
-          baseRadius,
-          data.coordinates
-        );
-        const riskLevel = this.determineRiskLevel(data.intensity);
-
-        // Create circular buffer around the point
-        const bufferCoords = this.createCircularBuffer(
-          data.coordinates,
-          radius
-        );
-
-        floodZones.push({
-          type: "Feature",
-          properties: {
-            segmentIndex: data.segmentIndex,
-            intensity: data.intensity,
-            radius: radius,
-            riskLevel: riskLevel,
-            isPrecipitationZone: true,
-            timestamp: Date.now(),
-          },
-          geometry: {
-            type: "Polygon",
-            coordinates: [bufferCoords],
-          },
-        });
-      }
+    const points = riverPath.map(([lng, lat], i) => {
+      const rateNow = ratesNow[i] ?? 0;
+      // If the next parcel is missing, assume the rate holds (rectangle rule)
+      const rateNext = ratesNext[i] ?? rateNow;
+      return {
+        segmentIndex: i,
+        coordinates: [lng, lat],
+        rateNow,
+        rateNext,
+        accumulationMm: estimateAccumulatedRainfall(
+          rateNow,
+          rateNext,
+          intervalHours
+        ),
+      };
     });
 
+    const rates = points.map((p) => p.rateNow);
     return {
-      type: "FeatureCollection",
-      features: floodZones,
+      points,
+      timeOffsets: { current: startOffset, next: nextOffset },
+      intervalHours,
+      summary: {
+        totalPoints: points.length,
+        rainingPoints: points.filter((p) => p.rateNow > 0).length,
+        maxRate: rates.length ? Math.max(...rates) : 0,
+        averageRate: rates.length
+          ? rates.reduce((sum, r) => sum + r, 0) / rates.length
+          : 0,
+        maxAccumulationMm: points.length
+          ? Math.max(...points.map((p) => p.accumulationMm))
+          : 0,
+      },
     };
-  }
-
-  // Create circular buffer coordinates
-  createCircularBuffer(center, radiusInMeters, points = 32) {
-    const coords = [];
-    const earthRadius = 6371000; // Earth's radius in meters
-
-    for (let i = 0; i < points; i++) {
-      const angle = (i * 2 * Math.PI) / points;
-      const latOffset = (radiusInMeters / earthRadius) * (180 / Math.PI);
-      const lngOffset =
-        ((radiusInMeters / earthRadius) * (180 / Math.PI)) /
-        Math.cos((center[1] * Math.PI) / 180);
-
-      const lat = center[1] + latOffset * Math.cos(angle);
-      const lng = center[0] + lngOffset * Math.sin(angle);
-
-      coords.push([lng, lat]);
-    }
-
-    // Close the polygon
-    coords.push(coords[0]);
-
-    return coords;
   }
 }
 
-// Usage example
-export const createPrecipitationAnalyzer = () => {
-  return new PrecipitationAnalyzer();
-};
-
-// Helper function to integrate with existing flood risk system
-export const integratePrecipitationAnalysis = (
-  floodRiskCalculator,
-  precipitationAnalyzer
-) => {
-  return {
-    async updateWithRealPrecipitation(
-      riverPath,
-      currentTimeOffset,
-      referenceTimeOffset = 0
-    ) {
-      const comparison = await precipitationAnalyzer.comparePrecipitationData(
-        riverPath,
-        currentTimeOffset,
-        referenceTimeOffset
-      );
-
-      // Add precipitation data to flood risk calculator
-      const timestamp = Date.now() - currentTimeOffset * 3600000;
-
-      comparison.changes.forEach((change) => {
-        floodRiskCalculator.addPrecipitationData(
-          timestamp,
-          change.currentIntensity,
-          [change.segmentIndex]
-        );
-      });
-
-      return {
-        precipitationData: comparison,
-        floodRiskZones: floodRiskCalculator.generateCombinedFloodRiskZones(
-          Date.now(),
-          comparison.currentData
-        ),
-      };
-    },
-  };
-};
+export const createPrecipitationAnalyzer = () => new PrecipitationAnalyzer();
